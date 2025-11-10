@@ -1,0 +1,180 @@
+# MERRA-2 Atmospheric Forecasting using Deep Learning
+
+This repository contains a deep learning framework for short-term forecasting of atmospheric variables using the NASA MERRA-2 reanalysis dataset.  
+The model predicts next-timestep geophysical fields such as temperature, humidity, and wind components at multiple pressure levels from the previous timestep, enabling data-driven weather analysis and simulation.
+
+---
+
+## Overview
+
+| Component | Description |
+|------------|-------------|
+| **Dataset** | NASA MERRA-2 (Modern-Era Retrospective Analysis for Research and Applications) |
+| **Model** | UNet-style convolutional encoder–decoder network |
+| **Framework** | PyTorch with Distributed Data Parallel (DDP) training |
+| **Objective** | Predict the next timestep (*t+1*) atmospheric state given the current state (*t*) |
+| **Applications** | Data-driven forecasting, climate modeling, and geophysical analysis |
+
+---
+
+## Model Architecture
+
+The model is implemented in `model.py` as a UNet-style convolutional architecture with:
+
+- Residual blocks using Group Normalization and SiLU activations  
+- Multi-scale downsampling and upsampling with skip connections  
+- A bottleneck for feature compression and representation learning  
+- Configurable input and output channels based on selected MERRA-2 variables
+
+Example model initialization:
+
+```python
+model = ForecastModel(
+    in_channels=52,
+    out_channels=52,
+    img_resolution=(320, 512),
+    dim=192,
+    depth=4
+)
+```
+---
+
+Project Structure
+```
+Merra2/
+├── train.py                   # Distributed training script
+├── model.py                   # ForecastModel (UNet architecture)
+├── merra2_nc_dataloader.py    # Custom MERRA-2 NetCDF dataloader
+├── refined_config.yaml         # Configuration file for variables, model, and training
+├── animate_checkpoint_all.py  # Animation script for model predictions
+├── builder_stats_*.sh         # Scripts for mean/std computation
+├── slurm_train.sh             # SLURM submission script for training
+├── test_slurm.sh              # SLURM script for dataset statistics
+└── README.md
+```
+---
+
+Training
+
+Training is performed on multi-GPU systems using SLURM or torchrun.
+
+Example command (within an HPC job or local environment):
+```
+torchrun \
+  --nnodes=1 \
+  --nproc_per_node=2 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  train.py --config refined_config.yaml
+```
+Alternatively:
+
+python train.py --config refined_config.yaml
+
+Model checkpoints are automatically saved under:
+```
+checkpoints_merra2_52var/
+  ├── merra2_subset_52var_best.pt
+  └── merra2_subset_52var_last.pt
+```
+
+⸻
+
+Configuration
+
+The experiment configuration file refined_config.yaml defines:
+	•	Input and target variables
+	•	Model architecture parameters
+	•	Training hyperparameters
+	•	Dataset and storage paths
+
+Example structure:
+```
+data:
+  root_dir: "/path/to/MERRA2_splits"
+  variables:
+    - temperature_50; temperature_100; ...; temperature_1000
+    - u_component_of_wind_50; ...; u_component_of_wind_1000
+    - v_component_of_wind_50; ...; v_component_of_wind_1000
+    - specific_humidity_50; ...; specific_humidity_1000
+  batch_size: 8
+  num_workers: 4
+
+model:
+  img_resolution: [320, 512]
+  dim: 192
+  depth: 4
+
+training:
+  epochs: 20
+  learning_rate: 8e-5
+  ema_decay: 0.999
+```
+
+⸻
+
+Inference and Visualization
+
+Model predictions can be visualized as animated GIFs to compare input, ground truth, and predicted atmospheric fields.
+
+Example usage:
+```
+python animate_checkpoint_all.py \
+  --root /path/to/MERRA2_splits \
+  --split val \
+  --config refined_config.yaml \
+  --ckpt ./checkpoints_merra2_52var/merra2_subset_52var_best.pt \
+  --vars temperature_300 temperature_700 temperature_925 temperature_1000 \
+  --physical --with_diff \
+  --outdir ./MERRA2_gifs
+```
+Each generated animation displays:
+```
+[input @ t] | [ground truth @ t+1] | [model prediction] | [|GT - prediction|]
+```
+The updated visualization code uses pcolormesh instead of imshow to accurately represent geophysical coordinates (latitude/longitude) and handle masked values correctly.
+
+⸻
+
+Results
+
+Sample outputs (temperature variables at different pressure levels):
+
+Variable	Description
+temperature_300	Tropospheric temperature gradient
+temperature_700	Mid-tropospheric temperature field
+temperature_925	Near-surface temperature distribution
+temperature_1000	Surface-level temperature variability
+
+
+⸻
+
+Technical Highlights
+	•	Distributed Data Parallel (DDP) training using the NCCL backend
+	•	Mixed-precision training (AMP) and gradient accumulation for efficiency
+	•	Exponential Moving Average (EMA) model updates for stability
+	•	Robust masked MSE loss to handle missing values
+	•	Automatic normalization using dataset-specific mean and standard deviation
+
+⸻
+
+Physics Context
+
+This model is trained on NASA MERRA-2 reanalysis data, which is itself generated by physically grounded atmospheric simulations.
+While the present approach is data-driven rather than explicitly physics-informed, the learned mappings implicitly reflect the underlying physical laws (e.g., thermodynamic and dynamical constraints).
+
+⸻
+
+Author
+
+Saptarshi Roy
+M.S. in Informatics (Data Science)
+The Pennsylvania State University
+
+⸻
+
+Citation
+
+If you use this code or any derived work, please cite:
+
+---

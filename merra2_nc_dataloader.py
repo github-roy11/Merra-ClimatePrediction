@@ -6,12 +6,10 @@ import torch
 from torch.utils.data import Dataset
 import xarray as xr
 
-# ---------- variable token parsing ----------
-# ERA5-style tokens -> MERRA-2 short codes
-# 3D on pressure levels (has 'lev'): codes below
-# 2D (no 'lev'): PS, SLP, PHIS
+# ---------------- variable token parsing ----------------
+# ERA-style tokens -> MERRA-2 short codes
 VAR_MAP: Dict[str, str] = {
-    # 3D:
+    # 3D (has 'lev'):
     "temperature": "T",
     "u_component_of_wind": "U",
     "v_component_of_wind": "V",
@@ -23,76 +21,76 @@ VAR_MAP: Dict[str, str] = {
     "cloud_liquid": "QL",
     "epv": "EPV",
     "ozone": "O3",
-    # 2D:
+    # 2D (no 'lev'):
     "surface_pressure": "PS",
     "mean_sea_level_pressure": "SLP",
     "surface_geopotential": "PHIS",
 }
 
-def _expand_semicolon_groups(tokens):
-    """Allow YAML like '- a; b; c'. Returns a flat list of clean tokens."""
-    out = []
+def _expand_semicolon_groups(tokens: List[str]) -> List[str]:
+    """Allow YAML lines like '- a; b; c'. Returns a flat list."""
+    out: List[str] = []
     for t in tokens:
         if isinstance(t, str) and ";" in t:
             out.extend([s.strip() for s in t.split(";") if s.strip()])
         else:
-            out.append(t)
+            out.append(str(t))
     return out
 
 def parse_token(token: str) -> Tuple[str, Optional[float]]:
     """
     Accepts:
-      - full 2D names (no level): e.g. 'surface_pressure', 'mean_sea_level_pressure', 'surface_geopotential'
-      - 3D names with a numeric level: e.g. 'temperature_500'
+      - 2D names: 'surface_pressure', 'mean_sea_level_pressure', 'surface_geopotential'
+      - 3D names with level: 'temperature_500', 'u_component_of_wind_850', ...
+    Returns (MERRA_code, level_or_None).
     """
-    # 1) Exact 2D token (the whole token is the variable name)
     if token in VAR_MAP:
         return VAR_MAP[token], None
-
-    # 2) 3D token with a trailing numeric level
     if "_" in token:
         base, lvl = token.rsplit("_", 1)
         if base in VAR_MAP:
             try:
                 return VAR_MAP[base], float(lvl)
             except ValueError:
-                # trailing part isn't numeric -> treat as invalid 3D token
-                pass  # fall through to error below
-
+                pass
     raise KeyError(
-        f"Variable token '{token}' not supported. "
-        f"Supported 2D names: {[k for k in VAR_MAP.keys() if k in ['surface_pressure','mean_sea_level_pressure','surface_geopotential']]} "
-        f"and 3D patterns like 'temperature_500', 'u_component_of_wind_850', etc."
+        f"Unsupported token '{token}'. "
+        "Use 2D: surface_pressure|mean_sea_level_pressure|surface_geopotential "
+        "or 3D like 'temperature_500', 'u_component_of_wind_300', ..."
     )
 
 def _ensure_lon_range(ds: xr.Dataset) -> xr.Dataset:
-    """Normalize lon to [-180, 180) and sort if needed."""
+    """Normalize lon to [-180, 180) and sort by lon if needed."""
     if "lon" in ds.coords:
         lo = ds["lon"]
         if (lo > 180).any():
             ds = ds.assign_coords(lon=((lo + 180) % 360) - 180).sortby("lon")
     return ds
 
+def _ensure_lat_ascending(ds: xr.Dataset) -> xr.Dataset:
+    """Sort latitude ascending (many reanalyses store descending)."""
+    lat_name = "lat" if "lat" in ds.coords else ("latitude" if "latitude" in ds.coords else None)
+    if lat_name is None:
+        raise KeyError("lat/latitude coordinate not found.")
+    if np.any(np.diff(ds[lat_name].values) < 0):
+        ds = ds.sortby(lat_name, ascending=True)
+    return ds
 
-# -------------- Dataset -----------------
+# ---------------- dataset ----------------
 class MERRA2SR(Dataset):
     """
-    MERRA-2 M2I3NPASM (3-hourly instantaneous) dataloader for time-step prediction.
+    MERRA-2 (e.g., M2I3NPASM) loader for next-timestep prediction.
 
-    Returns (xb, tb) where:
-      xb: all selected variables at time t   -> FloatTensor [C, H, W]
-      tb: all selected variables at time t+1 -> FloatTensor [C, H, W]
+    Returns standardized tensors:
+      xb: [C,H,W] at time t
+      tb: [C,H,W] at time t+1
 
-    Normalization files at <root>:
-      normalize_mean.npz  and  normalize_std.npz
-      Keys must match your tokens (e.g. 'temperature_500', 'surface_pressure', ...).
+    Normalization files expected at <root> (keys are *your tokens*):
+      normalize_mean.npz, normalize_std.npz
 
     Directory layout:
-      - <root>/train, <root>/val, <root>/test (can be symlinked years).
-      - Set split='train'|'val'|'test' to read under root/split.
-      - This loader follows symlinks when collecting files.
+      <root>/{train,val,test}/... .nc4 files (symlinks ok)
     """
-
     def __init__(
         self,
         root: str,
@@ -106,214 +104,176 @@ class MERRA2SR(Dataset):
         self.engine = engine
         self.lat_first = lat_first
 
-        # -------- collect files (follow symlinks) --------
+        # ---- collect files (follow symlinks) ----
         search_root = os.path.join(root, split) if (split and os.path.isdir(os.path.join(root, split))) else root
         self.files: List[str] = self._collect_nc4_files(search_root)
         if not self.files:
-            raise FileNotFoundError(f"No .nc4 found under {search_root}. Check paths/symlinks/permissions.")
+            raise FileNotFoundError(f"No .nc4 files under {search_root}")
 
-        # -------- variables + (code,level) parsing --------
-        # self.variables_tokens = _expand_semicolon_groups(list(variables))           # keep exact order
-        # self.variables_parsed = [parse_token(v) for v in variables]  # -> [(code, level_or_None), ...]
-        
-        self.variables_tokens = _expand_semicolon_groups(list(variables))  # keep exact order
-        self.variables_parsed = [parse_token(v) for v in self.variables_tokens]  # <- fixed
+        # ---- variable parsing & order ----
+        self.variables_tokens = _expand_semicolon_groups(list(variables))
+        self.variables_parsed = [parse_token(v) for v in self.variables_tokens]
 
-        # -------- probe grid + snap levels --------
-        probe = xr.open_dataset(self.files[0], engine=self.engine, chunks=None)
-        probe = _ensure_lon_range(probe)
+        # ---- probe first file for grid & level snapping ----
+        with xr.open_dataset(self.files[0], engine=self.engine, chunks=None) as probe:
+            probe = _ensure_lon_range(_ensure_lat_ascending(probe))
 
-        # available levels
-        self._levs = np.array(probe["lev"].values, dtype=float) if "lev" in probe.coords else np.array([])
-        # build level index per var; None for 2D vars
-        self._lev_index: List[Optional[int]] = []
-        for (code, lvl) in self.variables_parsed:
-            if code not in probe.variables:
-                raise KeyError(f"MERRA-2 file missing variable '{code}'. Check product/content.")
-            if lvl is None:
-                self._lev_index.append(None)  # 2D var
-            else:
-                j = int(np.argmin(np.abs(self._levs - float(lvl))))
-                self._lev_index.append(j)
+            self.lat_name = "lat" if "lat" in probe.coords else "latitude"
+            self.lon_name = "lon" if "lon" in probe.coords else "longitude"
 
-        H = int(probe.sizes["lat"])
-        W = int(probe.sizes["lon"])
-        self.CHW = (len(self.variables_tokens), H, W)
-        probe.close()
+            self._levs = np.array(probe["lev"].values, dtype=float) if "lev" in probe.coords else np.array([])
+            self._lev_index: List[Optional[int]] = []
+            for (code, lvl) in self.variables_parsed:
+                if code not in probe.variables:
+                    raise KeyError(f"'{code}' not found in {os.path.basename(self.files[0])}")
+                if lvl is None:
+                    self._lev_index.append(None)  # 2D var
+                else:
+                    j = int(np.argmin(np.abs(self._levs - float(lvl))))
+                    self._lev_index.append(j)
 
-        # -------- normalization (train stats) --------
+            H = int(probe.sizes[self.lat_name])
+            W = int(probe.sizes[self.lon_name])
+
+        self.C = len(self.variables_tokens)
+        self.H, self.W = H, W
+
+        # ---- normalization (by token name) ----
         mean_path = os.path.join(root, "normalize_mean.npz")
         std_path  = os.path.join(root, "normalize_std.npz")
         if not (os.path.exists(mean_path) and os.path.exists(std_path)):
-            raise FileNotFoundError(
-                f"Normalization files not found:\n  {mean_path}\n  {std_path}\n"
-                f"Compute them first (on train) and place at the split root."
-            )
-        means_npz = np.load(mean_path)
-        stds_npz  = np.load(std_path)
-        try:
-            self.means = np.stack([means_npz[v] for v in self.variables_tokens], axis=0).reshape(-1, 1, 1).astype(np.float32)
-            self.stds  = np.stack([stds_npz[v]  for v in self.variables_tokens], axis=0).reshape(-1, 1, 1).astype(np.float32)
-        except KeyError as e:
-            missing = str(e).strip("'")
-            raise KeyError(f"normalize_mean/std missing key '{missing}'. Recompute stats with the exact same variable list.") from None
+            # allow fallback names 'mean.npz'/'std.npz'
+            alt_mean, alt_std = os.path.join(root, "mean.npz"), os.path.join(root, "std.npz")
+            if os.path.exists(alt_mean) and os.path.exists(alt_std):
+                mean_path, std_path = alt_mean, alt_std
+            else:
+                raise FileNotFoundError(
+                    f"Normalization files not found:\n  {mean_path}\n  {std_path}\n"
+                    "Compute/train stats first and save with token keys."
+                )
+        m, s = np.load(mean_path), np.load(std_path)
 
-        # cache #timesteps per file (usually 8)
-        self._T_cache: Dict[str, int] = {}
+        def _fetch_stat(npz, name):
+            vals = []
+            missing = []
+            for tok in self.variables_tokens:
+                if tok in npz:
+                    vals.append(np.float32(npz[tok]))
+                else:
+                    missing.append(tok)
+            if missing:
+                raise KeyError(
+                    f"{name} missing keys for tokens: {missing}\n"
+                    "Recompute stats with the exact same variable list and order."
+                )
+            arr = np.array(vals, dtype=np.float32).reshape(-1, 1, 1)
+            return arr
 
-    # ------------- utilities -------------
+        self.means = _fetch_stat(m, "normalize_mean.npz")
+        self.stds  = np.maximum(_fetch_stat(s, "normalize_std.npz"), 1e-6)
+
+        # ---- build a global (file, t) index so that t+1 always exists ----
+        self._index: List[Tuple[int, int]] = []  # (file_idx, t_in_file)
+        self._time_cache: List[np.ndarray] = []  # per-file time arrays
+        for fi, fp in enumerate(self.files):
+            with xr.open_dataset(fp, engine=self.engine, chunks=None) as ds:
+                T = int(ds.sizes["time"])
+                times = np.array(ds["time"].values)
+            self._time_cache.append(times)
+        # create pairs across boundaries: for all global t where next exists
+        for fi in range(len(self.files)):
+            T = len(self._time_cache[fi])
+            for ti in range(T):
+                # next time:
+                nfi, nti = fi, ti + 1
+                if nti >= T:
+                    nfi += 1
+                    nti = 0
+                if nfi < len(self.files):
+                    self._index.append((fi, ti))
+        # now __len__ is len(self._index)
+
+    # ---------------- dataset protocol ----------------
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int):
+        fi, ti = self._index[idx]
+        nfi, nti = self._next_pair(fi, ti)
+
+        x_arr = self._read_one_at(self.files[fi],  ti)   # [C,H,W]
+        t_arr = self._read_one_at(self.files[nfi], nti)  # [C,H,W]
+
+        xb = self._standardize(x_arr)
+        tb = self._standardize(t_arr)
+        return torch.from_numpy(xb), torch.from_numpy(tb)
+
+    # ---------------- helpers ----------------
     @staticmethod
     def _collect_nc4_files(root_dir: str) -> List[str]:
         out: List[str] = []
-        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=True):
+        for dirpath, _, filenames in os.walk(root_dir, followlinks=True):
             for fn in filenames:
                 if fn.endswith(".nc4"):
                     out.append(os.path.join(dirpath, fn))
         return sorted(out)
 
-    def _steps_in_file(self, fp: str) -> int:
-        T = getattr(self, "_T_cache", {}).get(fp)
-        if T is None:
-            ds = xr.open_dataset(fp, engine=self.engine, chunks=None)
-            T = int(ds.sizes["time"])
-            ds.close()
-            self._T_cache[fp] = T
-        return T
-    
-    def _standardize(self, x: np.ndarray) -> np.ndarray:
-        eps = 1e-6  # protect against tiny std
-        z = (x - self.means) / (self.stds + eps)
-        # clamp extreme z-scores so one bad pixel can't blow up activations
-        z = np.clip(z, -10.0, 10.0)
-        # ensure no NaN/Inf survives
-        return np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # ------------- dataset protocol -------------
-    def __len__(self) -> int:
-        """
-        Number of valid (t, t+1) pairs across all files.
-        Uses T of the first file (M2I3NPASM is consistent: T=8).
-        Returns total_steps - 1 so that t+1 always exists.
-        """
-        T0 = self._steps_in_file(self.files[0])
-        total_steps = len(self.files) * T0
-        return max(total_steps - 1, 0)
+    def _next_pair(self, fi: int, ti: int) -> Tuple[int, int]:
+        T = len(self._time_cache[fi])
+        nfi, nti = fi, ti + 1
+        if nti >= T:
+            nfi += 1
+            nti = 0
+        return nfi, nti
 
     def _read_one_at(self, fp: str, ti: int) -> np.ndarray:
         """
-        Read exact time index ti from file fp, stacking selected variables (2D+3D).
-        Returns np.ndarray [C, H, W] (float32).
+        Read exact time index ti from file fp and stack selected channels in
+        the order of self.variables_tokens. Returns [C,H,W] float32.
         """
-        ds = xr.open_dataset(fp, engine=self.engine, chunks=None)
-        ds = _ensure_lon_range(ds)
-        T = int(ds.sizes["time"])
-        if not (0 <= ti < T):
-            ds.close()
-            raise IndexError(f"time {ti} out of range [0,{T}) for {os.path.basename(fp)}")
+        with xr.open_dataset(fp, engine=self.engine, chunks=None) as ds:
+            ds = _ensure_lon_range(_ensure_lat_ascending(ds))
+            T = int(ds.sizes["time"])
+            if not (0 <= ti < T):
+                raise IndexError(f"time {ti} out of range [0,{T}) for {os.path.basename(fp)}")
 
-        chans = []
-        for (code, _lvl), li in zip(self.variables_parsed, self._lev_index):
-            if li is None:
-                # 2D variable, just pick time slice
-                da = ds[code].isel(time=ti)          # [lat, lon]
-            else:
-                # 3D variable, pick time and snapped level
-                da = ds[code].isel(time=ti, lev=li)  # [lat, lon]
-            arr = np.asarray(da.values, dtype=np.float32)
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            chans.append(arr)
-        ds.close()
-        return np.stack(chans, axis=0)  # [C, H, W]
+            chans = []
+            for (code, _lvl), li in zip(self.variables_parsed, self._lev_index):
+                if li is None:
+                    da = ds[code].isel(time=ti)              # 2D [lat,lon]
+                else:
+                    da = ds[code].isel(time=ti, lev=li)      # 3D slice [lat,lon]
+                # enforce (lat,lon) order then ndarray
+                da = da.transpose(self.lat_name, self.lon_name)
+                arr = np.asarray(da.values, dtype=np.float32)
+                arr[np.isinf(arr)] = np.nan
+                chans.append(arr)
+        out = np.stack(chans, axis=0)                        # [C,H,W]
+        # NaN hygiene only; standardization happens later
+        out = np.where(np.isfinite(out), out, np.nan)
+        return out
 
-    def __getitem__(self, idx: int):
-        """
-        Time-step prediction:
-          xb = variables at time t   -> [C,H,W]
-          tb = variables at time t+1 -> [C,H,W]
-        DataLoader will batch these to [B,C,H,W].
-        """
-        C, H, W = self.CHW
-        T = self._steps_in_file(self.files[0])
+    def _standardize(self, x: np.ndarray) -> np.ndarray:
+        # x: [C,H,W], per-channel z-score with finite-safe handling
+        z = (x - self.means) / self.stds
+        z = np.clip(z, -10.0, 10.0)
+        return np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-        file_i = idx // T
-        t_in   = idx % T
-
-        # next time (possibly next file)
-        next_file_i = file_i
-        next_t_in   = t_in + 1
-        if next_t_in >= T:
-            next_t_in = 0
-            next_file_i = file_i + 1
-
-        fp_x = self.files[file_i]
-        fp_t = self.files[next_file_i]
-
-        x_arr = self._read_one_at(fp_x, t_in)        # [C,H,W]
-        t_arr = self._read_one_at(fp_t, next_t_in)   # [C,H,W]
-
-        # standardize (train stats)
-        x_std = self._standardize(x_arr)
-        t_std = self._standardize(t_arr)
-
-        xb = torch.from_numpy(self._standardize(x_arr))  # [C,H,W]
-        tb = torch.from_numpy(self._standardize(t_arr))  # [C,H,W]
-        return xb, tb
-
-    # ------------- convenience -------------
+    # ---------------- convenience ----------------
     @property
     def img_resolution(self) -> Tuple[int, int]:
-        _, H, W = self.CHW
-        return H, W
+        return (self.H, self.W)
 
     def get_lat_lon(self) -> Tuple[np.ndarray, np.ndarray]:
-        ds = xr.open_dataset(self.files[0], engine=self.engine, chunks=None)
-        lat = np.array(ds["lat"].values, dtype=np.float32)
-        lon = np.array(ds["lon"].values, dtype=np.float32)
-        ds.close()
+        with xr.open_dataset(self.files[0], engine=self.engine, chunks=None) as ds:
+            ds = _ensure_lon_range(_ensure_lat_ascending(ds))
+            lat = np.array(ds[self.lat_name].values, dtype=np.float32)
+            lon = np.array(ds[self.lon_name].values, dtype=np.float32)
         return lat, lon
 
     def get_time(self, idx: int) -> Tuple[np.datetime64, np.datetime64]:
-        """Return (time_t, time_t+1) for the given sample index."""
-        T = self._steps_in_file(self.files[0])
-        file_i = idx // T
-        t_in   = idx % T
-
-        next_file_i = file_i
-        next_t_in   = t_in + 1
-        if next_t_in >= T:
-            next_t_in = 0
-            next_file_i = file_i + 1
-
-        ds0 = xr.open_dataset(self.files[file_i], engine=self.engine, chunks=None)
-        ts0 = np.datetime64(ds0["time"].values[t_in])
-        ds0.close()
-
-        ds1 = xr.open_dataset(self.files[next_file_i], engine=self.engine, chunks=None)
-        ts1 = np.datetime64(ds1["time"].values[next_t_in])
-        ds1.close()
-        return ts0, ts1
-
-
-# ------------- quick self-test -------------
-if __name__ == "__main__":
-    from torch.utils.data import DataLoader
-
-    ROOT = "/storage/home/sbr5878/scratch/new_diffusion/MERRA2_splits"
-    # start small; expand once normalization is computed for your full list
-    VARS = [
-        "temperature_500",
-        "u_component_of_wind_500",
-        "v_component_of_wind_500",
-        "specific_humidity_500",
-        "surface_pressure",              # 2D example
-        "mean_sea_level_pressure",       # 2D example
-        "surface_geopotential",          # 2D example
-    ]
-
-    ds = MERRA2SR(root=ROOT, variables=VARS, split="train")
-    dl = DataLoader(ds, batch_size=8, shuffle=True, num_workers=1, pin_memory=True)
-
-    xb, tb = next(iter(dl))
-    print("xb:", xb.shape, "tb:", tb.shape)  # expect both [8, C, H, W]
-    print("mean xb:", xb.mean().item(), "std xb:", xb.std().item())
-    print("mean tb:", tb.mean().item(), "std tb:", tb.std().item())
+        fi, ti = self._index[idx]
+        nfi, nti = self._next_pair(fi, ti)
+        t0 = np.datetime64(self._time_cache[fi][ti])
+        t1 = np.datetime64(self._time_cache[nfi][nti])
+        return t0, t1
